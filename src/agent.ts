@@ -38,22 +38,26 @@ interface AccumulatedToolCall {
 }
 
 /**
- * ===== Agent 循环（流式输出版） =====
+ * ===== Agent 循环（流式输出 + 共享消息历史） =====
  *
  * 这是 Agent 的核心：一个"思考-行动-观察"的循环。
  *
+ * 与之前版本的关键区别：
+ *   messages 数组由调用方传入并维护，不再在函数内部创建。
+ *   这意味着多次调用 runAgentLoop 可以共享同一个 messages 数组，
+ *   实现跨 prompt 的对话记忆。
+ *
  * 流程：
- *   1. 把对话历史发给 LLM（流式模式）
+ *   1. 使用传入的 messages 数组（已包含 system + 历史 + 新 user 消息）调用 LLM
  *   2. 实时流式接收 LLM 的响应，逐 token 打印到终端
  *   3. 流结束后判断：
- *      a) 文本回复 → 任务完成，退出循环
+ *      a) 文本回复 → 把 assistant 消息追加到 messages，退出循环
  *      b) 工具调用 → 进入步骤 4
  *   4. 逐个检查工具是否需要确认：
  *      - safe 工具 → 直接执行
  *      - dangerous 工具 → 调用 confirmCallback 询问用户
- *   5. 执行工具，得到结果
- *   6. 把工具执行结果追加到对话历史中
- *   7. 回到步骤 1，让 LLM 根据新信息继续思考
+ *   5. 执行工具，把 assistant(tool_calls) 和 tool(result) 追加到 messages
+ *   6. 回到步骤 1，让 LLM 根据新信息继续思考
  *
  * 这个循环会一直运行，直到 LLM 决定不再调用工具（给出最终回复）。
  * 设置了 maxTurns 防止无限循环。
@@ -61,29 +65,11 @@ interface AccumulatedToolCall {
 export async function runAgentLoop(
   client: OpenAI,
   config: AgentConfig,
-  userMessage: string,
+  messages: ChatCompletionMessageParam[], // 共享的对话历史，由调用方维护
   confirmCallback: ConfirmCallback,
 ): Promise<string> {
-  // ---- 系统提示词：告诉 LLM 它的角色和行为规则 ----
-  const systemPrompt = `你是一个有用的 AI 助手。你可以使用提供的工具来帮助用户解决问题。
-当你需要使用工具时，直接调用对应的函数。
-当你已经获得足够信息来回答用户时，用中文给出简洁、友好的回复。`;
-
-  /**
-   * 对话历史数组。
-   * 这是 Agent 的"记忆"——LLM 每次调用都能看到之前的所有对话，
-   * 包括用户说的话、LLM 的回复、以及工具调用的结果。
-   *
-   * 格式遵循 OpenAI Chat Completions API 的 message 格式：
-   *   { role: "system" | "user" | "assistant" | "tool", content: "..." }
-   */
-  const messages: ChatCompletionMessageParam[] = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: userMessage },
-  ];
-
   // 安全阀：最多循环 10 轮，防止无限调用工具
-  const MAX_TURNS = 10;
+  const MAX_TURNS = 30;
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     console.log(c.dim(`\n--- Agent 循环 第 ${turn + 1} 轮 ---`));
@@ -262,6 +248,13 @@ export async function runAgentLoop(
     // 文本已经在流式接收时实时打印到终端了
     // =========================================
     const finalAnswer = fullContent || "（LLM 未返回内容）";
+
+    // 把 LLM 的最终回复也追加到对话历史，下次对话 LLM 能看到
+    messages.push({
+      role: "assistant",
+      content: finalAnswer,
+    });
+
     console.log(c.green("\n✅ LLM 给出了最终回复（不再调用工具）"));
     return finalAnswer;
   }

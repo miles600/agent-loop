@@ -4,6 +4,10 @@
  * 这是一个交互式命令行 Agent。
  * 启动后可以持续与 Agent 对话，每次对话都会完整展示 Agent 的内部思考循环。
  *
+ * 特殊命令:
+ *   reset  - 清空对话历史（保留系统提示词）
+ *   quit   - 退出程序
+ *
  * 使用方法:
  *   cd agent-cli
  *   npm start                              # 使用默认 Provider
@@ -11,6 +15,7 @@
  */
 
 import OpenAI from "openai";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import * as readline from "node:readline";
 import { loadConfig, listProviders } from "./config.ts";
 import { runAgentLoop, type ConfirmCallback } from "./agent.ts";
@@ -22,6 +27,7 @@ const c = {
   cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,
   red: (s: string) => `\x1b[31m${s}\x1b[0m`,
   yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
+  magenta: (s: string) => `\x1b[35m${s}\x1b[0m`,
 };
 
 async function main() {
@@ -49,7 +55,7 @@ async function main() {
   console.log(c.dim(`  API:      ${config.baseURL}`));
   console.log(c.dim(`  可用 Provider: ${allProviders.join(", ")}`));
   console.log(c.dim(`  切换方式: AGENT_PROVIDER=<name> npm start`));
-  console.log(c.dim("\n  输入问题开始对话，输入 'quit' 或 Ctrl+C 退出"));
+  console.log(c.dim("\n  输入问题开始对话，输入 'reset' 清空记忆，'quit' 退出"));
   console.log(c.dim("  每一步都会展示 Agent 的思考-调用-观察循环\n"));
 
   // ---- 创建交互式命令行界面 ----
@@ -58,6 +64,31 @@ async function main() {
     output: process.stdout,
     prompt: c.bold("\n👤 你: "),
   });
+
+  /**
+   * ===== 跨 prompt 对话记忆 =====
+   *
+   * messages 数组在 index.ts 中维护，而不是在 runAgentLoop 内部创建。
+   * 这意味着每次用户输入新 prompt 时，LLM 都能看到之前的所有对话历史。
+   *
+   * 数组结构：
+   *   [system, user1, assistant1, ..., userN, assistantN]
+   *   如果有工具调用，中间还会穿插 tool_calls 和 tool 消息。
+   */
+  const messages: ChatCompletionMessageParam[] = [
+    {
+      role: "system",
+      content: `你是一个有用的 AI 助手。你可以使用提供的工具来帮助用户解决问题。
+当你需要使用工具时，直接调用对应的函数。
+当你已经获得足够信息来回答用户时，用中文给出简洁、友好的回复。
+
+## 持久记忆
+项目根目录有一个 AGENTS.md 文件，是你可以读写的长期记忆。
+- 需要记住重要信息时，用 file_write 写入 AGENTS.md（追加到末尾，不要覆盖）
+- 每次对话开始时，用 file_read 读取 AGENTS.md 回顾之前的记忆
+- AGENTS.md 最大 5000 字符，写入前请先读取确认当前长度，超出时精简旧内容`,
+    },
+  ];
 
   rl.prompt();
 
@@ -113,6 +144,17 @@ async function main() {
       process.exit(0);
     }
 
+    // reset 命令：清空对话历史，只保留 system prompt
+    if (input.toLowerCase() === "reset") {
+      console.log(c.magenta("\n🔄 已清空对话记忆，保留系统提示词"));
+      console.log(c.dim(`   清空前消息数: ${messages.length}`));
+      // 只保留第一条 system 消息，删除所有后续消息
+      messages.length = 1;
+      console.log(c.dim(`   清空后消息数: ${messages.length}\n`));
+      rl.prompt();
+      return;
+    }
+
     if (isBusy) {
       console.log(c.dim("⏳ Agent 正在思考中，请等待...\n"));
       return;
@@ -120,7 +162,12 @@ async function main() {
 
     isBusy = true;
     try {
-      await runAgentLoop(client, config, input, confirmCallback);
+      /**
+       * 把用户消息追加到共享的 messages 数组。
+       * 这样 LLM 能看到之前所有的对话历史。
+       */
+      messages.push({ role: "user", content: input });
+      await runAgentLoop(client, config, messages, confirmCallback);
     } finally {
       isBusy = false;
       if (isClosing) {
