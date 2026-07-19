@@ -1,20 +1,30 @@
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { AgentConfig } from "./config.ts";
-import { allTools, findTool } from "./tools.ts";
+import { allTools, findTool, isDangerous } from "./tools.ts";
 
 // ============================================================
 // 颜色输出辅助函数 —— 让终端输出更直观地展示 Agent 内部运转
 // ============================================================
 const c = {
-  dim: (s: string) => `\x1b[2m${s}\x1b[0m`,      // 灰色 — 辅助信息
-  cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,     // 青色 — Agent 状态
-  yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,   // 黄色 — 工具调用
-  green: (s: string) => `\x1b[32m${s}\x1b[0m`,    // 绿色 — 工具返回
-  blue: (s: string) => `\x1b[34m${s}\x1b[0m`,     // 蓝色 — 最终回复
-  red: (s: string) => `\x1b[31m${s}\x1b[0m`,      // 红色 — 错误
-  bold: (s: string) => `\x1b[1m${s}\x1b[0m`,      // 加粗
+  dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
+  cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,
+  yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
+  green: (s: string) => `\x1b[32m${s}\x1b[0m`,
+  blue: (s: string) => `\x1b[34m${s}\x1b[0m`,
+  red: (s: string) => `\x1b[31m${s}\x1b[0m`,
+  bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
 };
+
+/**
+ * 确认回调函数类型
+ * 接收工具名和参数，返回用户是否同意执行
+ * 用于危险操作（file_write、run_bash）执行前的用户确认
+ */
+export type ConfirmCallback = (
+  toolName: string,
+  args: Record<string, unknown>,
+) => Promise<boolean>;
 
 /**
  * ===== Agent 循环 =====
@@ -26,9 +36,12 @@ const c = {
  *   2. LLM 返回两种可能：
  *      a) 一段文本回复 → 任务完成，退出循环
  *      b) 一个或多个工具调用请求 → 进入步骤 3
- *   3. 逐个执行 LLM 请求的工具，得到结果
- *   4. 把工具执行结果追加到对话历史中
- *   5. 回到步骤 1，让 LLM 根据新信息继续思考
+ *   3. 逐个检查工具是否需要确认：
+ *      - safe 工具 → 直接执行
+ *      - dangerous 工具 → 调用 confirmCallback 询问用户
+ *   4. 执行工具，得到结果
+ *   5. 把工具执行结果追加到对话历史中
+ *   6. 回到步骤 1，让 LLM 根据新信息继续思考
  *
  * 这个循环会一直运行，直到 LLM 决定不再调用工具（给出最终回复）。
  * 设置了 maxTurns 防止无限循环。
@@ -37,6 +50,7 @@ export async function runAgentLoop(
   client: OpenAI,
   config: AgentConfig,
   userMessage: string,
+  confirmCallback: ConfirmCallback,
 ): Promise<string> {
   // ---- 系统提示词：告诉 LLM 它的角色和行为规则 ----
   const systemPrompt = `你是一个有用的 AI 助手。你可以使用提供的工具来帮助用户解决问题。
@@ -112,7 +126,6 @@ export async function runAgentLoop(
        */
       for (const toolCall of assistantMessage.tool_calls) {
         const toolName = toolCall.function.name;
-        // LLM 返回的参数是 JSON 字符串，需要解析
         const toolArgs = JSON.parse(toolCall.function.arguments);
         const tool = findTool(toolName);
 
@@ -121,18 +134,46 @@ export async function runAgentLoop(
         console.log(c.yellow(`     ├─ ID:        ${toolCall.id}`));
         console.log(c.yellow(`     ├─ 参数:      ${JSON.stringify(toolArgs)}`));
 
-        // 执行工具
-        console.log(c.yellow(`     ├─ 状态:      执行中...`));
         let toolResult: string;
-        if (tool) {
-          toolResult = await tool.execute(toolArgs);
-          console.log(c.green(`     └─ 返回结果:  ${toolResult}`));
-        } else {
+
+        if (!tool) {
           toolResult = `错误: 未找到工具 "${toolName}"`;
           console.log(c.red(`     └─ 返回结果:  ${toolResult}`));
+        } else {
+          // 打印风险等级
+          const riskLabel = isDangerous(tool) ? "🔴 危险" : "🟢 安全";
+          console.log(c.yellow(`     ├─ 风险等级:  ${riskLabel}`));
+
+          /**
+           * 步骤 3: 权限检查
+           * 危险工具（file_write、run_bash）需要用户确认后才能执行
+           */
+          if (isDangerous(tool)) {
+            console.log(c.yellow(`     ├─ 状态:      ⚠️ 等待用户确认...`));
+            const approved = await confirmCallback(toolName, toolArgs);
+
+            if (!approved) {
+              // 用户拒绝执行，告诉 LLM 操作被取消
+              toolResult = `操作被用户拒绝: ${toolName}(${JSON.stringify(toolArgs)})。请向用户解释原因并尝试其他方式。`;
+              console.log(c.red(`     └─ 返回结果:  ❌ 用户拒绝了此操作`));
+              messages.push({
+                role: "tool",
+                tool_call_id: toolCall.id,
+                content: toolResult,
+              });
+              continue;
+            }
+            console.log(c.yellow(`     ├─ 状态:      ✅ 用户已确认，执行中...`));
+          } else {
+            console.log(c.yellow(`     ├─ 状态:      执行中...`));
+          }
+
+          // 步骤 4: 执行工具
+          toolResult = await tool.execute(toolArgs);
+          console.log(c.green(`     └─ 返回结果:  ${toolResult}`));
         }
 
-        // 步骤 3: 把工具执行结果追加到对话历史
+        // 步骤 5: 把工具执行结果追加到对话历史
         messages.push({
           role: "tool",
           tool_call_id: toolCall.id,

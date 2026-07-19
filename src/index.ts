@@ -13,13 +13,15 @@
 import OpenAI from "openai";
 import * as readline from "node:readline";
 import { loadConfig, listProviders } from "./config.ts";
-import { runAgentLoop } from "./agent.ts";
+import { runAgentLoop, type ConfirmCallback } from "./agent.ts";
 
 // 颜色输出
 const c = {
   bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
   cyan: (s: string) => `\x1b[36m${s}\x1b[0m`,
+  red: (s: string) => `\x1b[31m${s}\x1b[0m`,
+  yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
 };
 
 async function main() {
@@ -64,6 +66,34 @@ async function main() {
   // 是否正在关闭中
   let isClosing = false;
 
+  /**
+   * 确认回调：当 Agent 要执行危险操作时，询问用户是否允许
+   * 返回 true 表示允许执行，false 表示拒绝
+   */
+  const confirmCallback: ConfirmCallback = async (toolName, args) => {
+    // 构建完整的执行命令预览（遍历所有参数，不写死工具名，方便扩展）
+    const commandPreview = Object.entries(args)
+      .map(([k, v]) => {
+        const val = String(v);
+        return `  ${k}: ${val.length > 200 ? val.slice(0, 200) + "..." : val}`;
+      })
+      .join("\n");
+
+    console.log(c.red("\n  ╔══════════════════════════════════════╗"));
+    console.log(c.red("  ║  ⚠️  危险操作确认                      ║"));
+    console.log(c.red("  ╠══════════════════════════════════════╣"));
+    console.log(c.red(`  ║  工具: ${toolName.padEnd(31)}║`));
+    console.log(c.red(`  ║${commandPreview.padEnd(42)}║`));
+    console.log(c.red("  ╚══════════════════════════════════════╝"));
+
+    // 使用 rl.question 等待用户输入 y/n
+    return new Promise((resolve) => {
+      rl.question(c.yellow("\n  👆 是否允许执行? (y/n): "), (answer) => {
+        resolve(answer.toLowerCase().trim() === "y");
+      });
+    });
+  };
+
   // ---- 监听用户输入 ----
   rl.on("line", async (line) => {
     const input = line.trim();
@@ -74,7 +104,6 @@ async function main() {
     }
 
     if (input.toLowerCase() === "quit" || input.toLowerCase() === "exit") {
-      // 如果 Agent 正在忙，等到它完成后再退出
       if (isBusy) {
         console.log(c.dim("⏳ Agent 正在思考中，请等待完成或按 Ctrl+C 强制退出...\n"));
         return;
@@ -84,7 +113,6 @@ async function main() {
       process.exit(0);
     }
 
-    // 如果 Agent 正在忙，忽略本次输入
     if (isBusy) {
       console.log(c.dim("⏳ Agent 正在思考中，请等待...\n"));
       return;
@@ -92,7 +120,7 @@ async function main() {
 
     isBusy = true;
     try {
-      await runAgentLoop(client, config, input);
+      await runAgentLoop(client, config, input, confirmCallback);
     } finally {
       isBusy = false;
       if (isClosing) {
@@ -104,7 +132,6 @@ async function main() {
   });
 
   rl.on("close", () => {
-    // 如果 Agent 还在忙，等待它完成再退出
     if (isBusy) {
       console.log(c.dim("\n⏳ 等待 Agent 完成当前任务..."));
       isClosing = true;
