@@ -27,21 +27,33 @@ export type ConfirmCallback = (
 ) => Promise<boolean>;
 
 /**
- * ===== Agent 循环 =====
+ * 流式响应的工具调用累积结构
+ * 因为流式传输中 tool_calls 的 id、name、arguments 是分多个 chunk 到达的，
+ * 需要手动拼装成完整的工具调用对象
+ */
+interface AccumulatedToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+/**
+ * ===== Agent 循环（流式输出版） =====
  *
  * 这是 Agent 的核心：一个"思考-行动-观察"的循环。
  *
  * 流程：
- *   1. 把对话历史发给 LLM
- *   2. LLM 返回两种可能：
- *      a) 一段文本回复 → 任务完成，退出循环
- *      b) 一个或多个工具调用请求 → 进入步骤 3
- *   3. 逐个检查工具是否需要确认：
+ *   1. 把对话历史发给 LLM（流式模式）
+ *   2. 实时流式接收 LLM 的响应，逐 token 打印到终端
+ *   3. 流结束后判断：
+ *      a) 文本回复 → 任务完成，退出循环
+ *      b) 工具调用 → 进入步骤 4
+ *   4. 逐个检查工具是否需要确认：
  *      - safe 工具 → 直接执行
  *      - dangerous 工具 → 调用 confirmCallback 询问用户
- *   4. 执行工具，得到结果
- *   5. 把工具执行结果追加到对话历史中
- *   6. 回到步骤 1，让 LLM 根据新信息继续思考
+ *   5. 执行工具，得到结果
+ *   6. 把工具执行结果追加到对话历史中
+ *   7. 回到步骤 1，让 LLM 根据新信息继续思考
  *
  * 这个循环会一直运行，直到 LLM 决定不再调用工具（给出最终回复）。
  * 设置了 maxTurns 防止无限循环。
@@ -77,45 +89,103 @@ export async function runAgentLoop(
     console.log(c.dim(`\n--- Agent 循环 第 ${turn + 1} 轮 ---`));
 
     // =========================================
-    // 步骤 1: 调用 LLM，传入当前对话历史
+    // 步骤 1: 流式调用 LLM
     // =========================================
-    console.log(c.cyan("📡 发送请求到 LLM..."));
+    console.log(c.cyan("📡 发送请求到 LLM（流式模式）..."));
     console.log(c.dim(`   模型: ${config.model}`));
     console.log(c.dim(`   当前对话消息数: ${messages.length}`));
 
-    const response = await client.chat.completions.create({
+    /**
+     * stream: true 让 LLM 不等待全部生成完毕再返回，而是边生成边发送。
+     * 返回的是一个异步可迭代对象（AsyncIterable），每个 chunk 是一个小片段。
+     */
+    const stream = await client.chat.completions.create({
       model: config.model,
       messages,
-      // 把工具定义告诉 LLM，让它知道可以调用哪些工具
       tools: allTools.map((t) => ({
         type: "function" as const,
         function: t.definition,
       })),
-      // 让 LLM 自行决定是否调用工具（auto 模式）
       tool_choice: "auto",
+      stream: true, // 启用流式输出
     });
 
-    const choice = response.choices[0];
-    if (!choice) {
-      console.log(c.red("❌ LLM 返回为空"));
-      return "抱歉，请求失败。";
+    // ---- 累积器：从流式 chunk 中拼装完整的响应 ----
+    let fullContent = ""; // 累积文本内容
+    // 工具调用需要在 Map 中累积，因为可能有多个 tool_call 同时到达
+    const toolCallAcc = new Map<number, AccumulatedToolCall>();
+
+    process.stdout.write(c.blue("🤖 ")); // 打印 Agent 回复前缀
+
+    // 遍历流中的每一个 chunk
+    for await (const chunk of stream) {
+      const delta = chunk.choices?.[0]?.delta;
+      if (!delta) continue;
+
+      /**
+       * 文本内容增量（delta.content）
+       * 每个 chunk 可能包含几个字的文本，直接追加到终端即可实现打字机效果
+       */
+      if (delta.content) {
+        fullContent += delta.content;
+        process.stdout.write(delta.content); // 逐 token 输出到终端
+      }
+
+      /**
+       * 工具调用增量（delta.tool_calls）
+       * 工具调用的数据是分多个 chunk 到达的：
+       *   - 第一个 chunk 携带 id 和 function.name
+       *   - 后续 chunk 携带 function.arguments 的片段（JSON 字符串的一部分）
+       * 需要把这些片段拼成完整的工具调用
+       */
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index;
+          // 如果这个索引的工具调用还不存在，初始化一个空的累积器
+          if (!toolCallAcc.has(idx)) {
+            toolCallAcc.set(idx, { id: "", name: "", arguments: "" });
+          }
+          const acc = toolCallAcc.get(idx)!;
+          if (tc.id) acc.id = tc.id; // id 只在第一个 chunk 出现
+          if (tc.function?.name) acc.name += tc.function.name; // name 只在第一个 chunk 出现
+          if (tc.function?.arguments) acc.arguments += tc.function.arguments; // arguments 可能跨多个 chunk
+        }
+      }
     }
 
-    const assistantMessage = choice.message;
+    // 流结束，输出换行
+    if (fullContent) {
+      process.stdout.write("\n");
+    }
 
-    // =========================================
-    // 情况 A: LLM 决定调用工具
-    // =========================================
-    if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+    // ---- 判断流结束后的响应类型 ----
+
+    /**
+     * 情况 A: LLM 决定调用工具
+     * 工具调用的累积器中有数据，说明 LLM 想要调用工具
+     */
+    if (toolCallAcc.size > 0) {
       console.log(
-        c.yellow(`🔧 LLM 决定调用 ${assistantMessage.tool_calls.length} 个工具:`),
+        c.yellow(`\n🔧 LLM 决定调用 ${toolCallAcc.size} 个工具:`),
       );
+
+      // 将累积的工具调用拼装成 OpenAI API 兼容的格式
+      const toolCalls = Array.from(toolCallAcc.entries())
+        .sort(([a], [b]) => a - b) // 按 index 排序，保证顺序
+        .map(([_, tc]) => ({
+          id: tc.id,
+          type: "function" as const,
+          function: {
+            name: tc.name,
+            arguments: tc.arguments, // 累积完成的 JSON 字符串
+          },
+        }));
 
       // 先记录 LLM 的工具调用请求到对话历史
       messages.push({
         role: "assistant",
-        content: assistantMessage.content,
-        tool_calls: assistantMessage.tool_calls,
+        content: fullContent || null,
+        tool_calls: toolCalls,
       });
 
       /**
@@ -124,8 +194,9 @@ export async function runAgentLoop(
        * OpenAI 允许一次性返回多个 tool_calls，我们需要逐个处理。
        * 每个工具执行后，将结果以 role: "tool" 的消息格式追加到对话历史。
        */
-      for (const toolCall of assistantMessage.tool_calls) {
+      for (const toolCall of toolCalls) {
         const toolName = toolCall.function.name;
+        // LLM 返回的参数是 JSON 字符串，需要解析
         const toolArgs = JSON.parse(toolCall.function.arguments);
         const tool = findTool(toolName);
 
@@ -188,10 +259,10 @@ export async function runAgentLoop(
 
     // =========================================
     // 情况 B: LLM 给出最终文本回复（不再调用工具）
+    // 文本已经在流式接收时实时打印到终端了
     // =========================================
-    const finalAnswer = assistantMessage.content ?? "（LLM 未返回内容）";
+    const finalAnswer = fullContent || "（LLM 未返回内容）";
     console.log(c.green("\n✅ LLM 给出了最终回复（不再调用工具）"));
-    console.log(c.blue(`\n🤖 Agent 回复:\n${finalAnswer}`));
     return finalAnswer;
   }
 
