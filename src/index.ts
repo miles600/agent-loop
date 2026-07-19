@@ -18,7 +18,7 @@ import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import * as readline from "node:readline";
 import { loadConfig, listProviders } from "./config.ts";
-import { runAgentLoop, type ConfirmCallback } from "./agent.ts";
+import { runAgentLoop, compactMessages, type ConfirmCallback } from "./agent.ts";
 
 // 颜色输出
 const c = {
@@ -167,6 +167,8 @@ async function main() {
        * 这样 LLM 能看到之前所有的对话历史。
        */
       messages.push({ role: "user", content: input });
+      // 在调用 LLM 前先裁剪过长的上下文，防止超 token 限制
+      compactMessages(messages);
       await runAgentLoop(client, config, messages, confirmCallback);
     } finally {
       isBusy = false;

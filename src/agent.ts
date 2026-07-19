@@ -37,6 +37,88 @@ interface AccumulatedToolCall {
   arguments: string;
 }
 
+// ============================================================
+// 上下文管理 —— 防止 messages 数组无限膨胀
+// ============================================================
+
+// 上下文上限（字符数），约等于 8000 tokens
+// 超出后自动裁剪旧消息，保留 system prompt + 最近的消息
+const MAX_CONTEXT_CHARS = 16000;
+// 裁剪后至少保留最近的消息条数（防止把刚发生的对话也裁掉）
+const MIN_KEEP_MESSAGES = 6;
+
+/**
+ * 估算 messages 数组的总字符数
+ * 把每条消息的 content 和 tool_calls 的字符数累加
+ */
+function estimateContextSize(messages: ChatCompletionMessageParam[]): number {
+  let total = 0;
+  for (const msg of messages) {
+    if (typeof msg.content === "string") {
+      total += msg.content.length;
+    }
+    // role 本身也占几个字符
+    total += msg.role.length;
+    // tool_calls 的参数也占空间
+    if ("tool_calls" in msg && msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        total += tc.function.name.length + tc.function.arguments.length;
+      }
+    }
+  }
+  return total;
+}
+
+/**
+ * 裁剪 messages 数组，保留 system prompt 和最近的消息
+ *
+ * 策略：
+ *   1. system prompt（索引 0）永远保留
+ *   2. 从索引 1 开始，删除最旧的消息，直到总字符数降到阈值以下
+ *   3. 至少保留 MIN_KEEP_MESSAGES 条消息（不含 system prompt）
+ *
+ * 这种"滑动窗口"策略是最简单的上下文管理方式，
+ * 缺点是会丢失早期的对话信息。
+ * 更高级的做法（如摘要压缩）见下方注释。
+ *
+ * @returns 被裁剪掉的消息数量，0 表示不需要裁剪
+ */
+export function compactMessages(messages: ChatCompletionMessageParam[]): number {
+  if (messages.length <= 1) return 0;
+
+  const size = estimateContextSize(messages);
+  if (size <= MAX_CONTEXT_CHARS) return 0;
+
+  const removed = messages.length - MIN_KEEP_MESSAGES - 1;
+  if (removed <= 0) return 0;
+
+  console.log(
+    c.yellow(
+      `\n⚠️ 上下文超限 (${size} 字符 > ${MAX_CONTEXT_CHARS} 字符)，裁剪 ${removed} 条旧消息`,
+    ),
+  );
+
+  // 删除索引 1 到 removed 的消息（保留 system prompt 在索引 0）
+  messages.splice(1, removed);
+
+  const newSize = estimateContextSize(messages);
+  console.log(c.dim(`   裁剪后: ${newSize} 字符，${messages.length} 条消息`));
+
+  return removed;
+}
+
+/**
+ * 更高级的上下文管理策略（未实现，供参考）：
+ *
+ * 1. 摘要压缩 —— 让 LLM 把旧消息总结成一段话，替代原始消息
+ *    messages = [system, { role: "user", content: "之前的对话摘要: ..." }, ...recent]
+ *
+ * 2. 分层记忆 —— 最近 3 轮保留原文，3-10 轮保留摘要，更早的只保留关键词
+ *
+ * 3. 向量检索 —— 把所有历史消息向量化存到外部数据库，
+ *    每次提问时只检索和当前问题最相关的 N 条历史消息
+ */
+
 /**
  * ===== Agent 循环（流式输出 + 共享消息历史） =====
  *
@@ -73,6 +155,9 @@ export async function runAgentLoop(
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     console.log(c.dim(`\n--- Agent 循环 第 ${turn + 1} 轮 ---`));
+
+    // 步骤 0: 上下文管理 —— 裁剪过长的对话历史
+    compactMessages(messages);
 
     // =========================================
     // 步骤 1: 流式调用 LLM
