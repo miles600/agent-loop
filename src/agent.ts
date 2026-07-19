@@ -43,9 +43,9 @@ interface AccumulatedToolCall {
 // 上下文管理 —— 防止 messages 数组无限膨胀
 // ============================================================
 
-// 上下文上限（字符数），约等于 8000 tokens
+// 上下文上限（字符数），约等于 64000 tokens
 // 超出后自动裁剪旧消息，保留 system prompt + 最近的消息
-const MAX_CONTEXT_CHARS = 16000;
+const MAX_CONTEXT_CHARS = 128000;
 // 裁剪后至少保留最近的消息条数（防止把刚发生的对话也裁掉）
 const MIN_KEEP_MESSAGES = 6;
 
@@ -198,7 +198,7 @@ async function runSubAgent(
     config,
     subMessages,
     confirmCallback,
-    { logPrefix: "  │ ", tools: subTools, maxTurns: 10, label },
+    { logPrefix: "  │ ", tools: subTools, maxTurns: 10, label, noStream: true },
   );
 
   console.log(c.magenta("  ┌──────────────────────────────────────┐"));
@@ -221,6 +221,8 @@ export interface RunAgentLoopOptions {
   maxTurns?: number;
   /** Agent 标签，用于区分主 Agent 和子 Agent */
   label?: string;
+  /** 禁用流式输出，子 Agent 设为 true 避免并行输出穿插 */
+  noStream?: boolean;
 }
 
 /**
@@ -252,6 +254,7 @@ export async function runAgentLoop(
   const tools = options.tools ?? allTools;
   const MAX_TURNS = options.maxTurns ?? 30;
   const label = options.label ?? "主 Agent";
+  const noStream = options.noStream ?? false;
 
   // 带前缀的日志辅助函数
   const log = (msg: string) => console.log(logPrefix + msg);
@@ -289,7 +292,9 @@ export async function runAgentLoop(
     let fullContent = "";
     const toolCallAcc = new Map<number, AccumulatedToolCall>();
 
-    write(c.blue("🤖 "));
+if (!noStream) {
+      write(c.blue("🤖 "));
+    }
 
     for await (const chunk of stream) {
       const delta = chunk.choices?.[0]?.delta;
@@ -297,7 +302,9 @@ export async function runAgentLoop(
 
       if (delta.content) {
         fullContent += delta.content;
-        write(delta.content);
+        if (!noStream) {
+          write(delta.content); // 主 Agent 逐 token 流式输出
+        }
       }
 
       if (delta.tool_calls) {
@@ -315,7 +322,11 @@ export async function runAgentLoop(
     }
 
     if (fullContent) {
-      write("\n");
+      if (noStream) {
+        write(c.blue("🤖 ") + fullContent + "\n");
+      } else {
+        write("\n");
+      }
     }
 
     // ---- 判断流结束后的响应类型 ----

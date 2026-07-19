@@ -2,3 +2,4 @@ node_modules/
 dist/
 api_keys.yaml
 AGENTS.md
+CODE_REPORT.md
