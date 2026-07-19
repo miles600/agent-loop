@@ -300,6 +300,44 @@ const webFetchTool: Tool = {
 };
 
 // ============================================================
+// 工具 8: 委派子 Agent
+// 注意：这个工具的 execute 不会被正常调用，
+// 由 agent.ts 中的 runAgentLoop 特殊处理 —— 创建独立上下文运行子 Agent 循环
+// ============================================================
+const delegateTool: Tool = {
+  riskLevel: "safe",
+  definition: {
+    name: "delegate",
+    description:
+      "委派一个子 Agent 独立执行复杂任务。子 Agent 拥有独立的对话上下文，不会污染主 Agent 的记忆。可以同时委派多个子 Agent 并行执行。子 Agent 完成后返回结果摘要。",
+    parameters: {
+      type: "object",
+      properties: {
+        task: {
+          type: "string",
+          description:
+            "子 Agent 的系统提示词，描述它的角色、目标和约束。例如 '你是一个代码审查专家，请分析 README.md 的代码质量并给出改进建议'",
+        },
+        context: {
+          type: "string",
+          description: "给子 Agent 的补充信息和具体指令，例如 '重点关注错误处理和性能优化'",
+        },
+        tools: {
+          type: "string",
+          description:
+            "子 Agent 可以使用的工具列表，逗号分隔。例如 'file_read,calculate,web_fetch'。不填则使用所有安全工具（不含 delegate）。",
+        },
+      },
+      required: ["task"],
+    },
+  },
+  execute: async () => {
+    // delegate 工具由 agent.ts 特殊处理，这里的 execute 不会被调用
+    return "[INTERNAL] delegate 工具不应通过正常路径执行";
+  },
+};
+
+// ============================================================
 // 所有已注册的工具列表
 // 添加新工具只需在这里追加即可，Agent 会自动感知
 // ============================================================
@@ -311,7 +349,15 @@ export const allTools: Tool[] = [
   fileWriteTool,
   runBashTool,
   webFetchTool,
+  delegateTool,
 ];
+
+/**
+ * 获取除去 delegate 的工具列表（子 Agent 不能用 delegate 递归委派）
+ */
+export function getToolsWithoutDelegate(): Tool[] {
+  return allTools.filter((t) => t.definition.name !== "delegate");
+}
 
 /**
  * 根据工具名查找工具

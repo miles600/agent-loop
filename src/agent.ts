@@ -1,7 +1,8 @@
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { AgentConfig } from "./config.ts";
-import { allTools, findTool, isDangerous } from "./tools.ts";
+import { allTools, findTool, isDangerous, getToolsWithoutDelegate } from "./tools.ts";
+import type { Tool } from "./tools.ts";
 
 // ============================================================
 // 颜色输出辅助函数 —— 让终端输出更直观地展示 Agent 内部运转
@@ -14,6 +15,7 @@ const c = {
   blue: (s: string) => `\x1b[34m${s}\x1b[0m`,
   red: (s: string) => `\x1b[31m${s}\x1b[0m`,
   bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
+  magenta: (s: string) => `\x1b[35m${s}\x1b[0m`,
 };
 
 /**
@@ -57,9 +59,7 @@ function estimateContextSize(messages: ChatCompletionMessageParam[]): number {
     if (typeof msg.content === "string") {
       total += msg.content.length;
     }
-    // role 本身也占几个字符
     total += msg.role.length;
-    // tool_calls 的参数也占空间
     if ("tool_calls" in msg && msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         total += tc.function.name.length + tc.function.arguments.length;
@@ -98,7 +98,6 @@ export function compactMessages(messages: ChatCompletionMessageParam[]): number 
     ),
   );
 
-  // 删除索引 1 到 removed 的消息（保留 system prompt 在索引 0）
   messages.splice(1, removed);
 
   const newSize = estimateContextSize(messages);
@@ -120,15 +119,15 @@ const MAX_CONSECUTIVE_FAILURES = 3;
  */
 function isToolError(result: string): boolean {
   const errorPatterns = [
-    "错误",           // 通用错误前缀
-    "无法",           // 无法计算、无法读取等
-    "失败",           // 抓取失败、写入失败等
-    "[ERROR]",        // 标准错误格式
-    "操作被用户拒绝",  // 用户拒绝了危险操作
-    "Error:",         // 英文错误
-    "not found",      // 文件不存在
-    "HTTP 4",         // 4xx 客户端错误
-    "HTTP 5",         // 5xx 服务端错误
+    "错误",
+    "无法",
+    "失败",
+    "[ERROR]",
+    "操作被用户拒绝",
+    "Error:",
+    "not found",
+    "HTTP 4",
+    "HTTP 5",
   ];
   return errorPatterns.some((p) => result.includes(p));
 }
@@ -144,28 +143,90 @@ function formatToolResult(result: string): { output: string; isError: boolean } 
   };
 }
 
-/**
- * 更高级的反思/纠错策略（未实现，供参考）：
- *
- * 1. 反思链 —— 不止告诉 LLM 失败了，还让它显式输出"为什么失败"和"新策略"
- *    在 reflection prompt 中要求 LLM 先输出分析再尝试
- *
- * 2. 自适应重试 —— 根据错误类型自动调整参数
- *    例如 URL 404 → 尝试去掉路径重试；DNS 失败 → 建议用户检查网络
- *
- * 3. 工具降级 —— 当前工具不可用时，自动切换到备选工具
- *    例如 web_fetch 失败 → 尝试用 file_read 读取本地缓存
- */
+// ============================================================
+// 多 Agent 协作 —— 委派子 Agent 独立执行任务
+// ============================================================
 
 /**
- * ===== Agent 循环（流式输出 + 共享消息历史） =====
+ * 运行一个子 Agent 循环
+ *
+ * 子 Agent 拥有独立的 messages 上下文，不会污染主 Agent 的对话历史。
+ * 子 Agent 使用简化的工具列表（不含 delegate，防止递归），
+ * 且运行轮数更少（10 轮），避免子 Agent 消耗过多时间。
+ *
+ * @param task - 主 Agent 为子 Agent 编写的系统提示词
+ * @param context - 补充上下文信息
+ * @param allowedTools - 子 Agent 可用的工具名称列表
+ * @returns 子 Agent 的最终回复，作为工具结果返回给主 Agent
+ */
+async function runSubAgent(
+  client: OpenAI,
+  config: AgentConfig,
+  task: string,
+  context: string,
+  allowedTools: string[],
+  confirmCallback: ConfirmCallback,
+  label: string,
+): Promise<string> {
+  // 子 Agent 的独立对话上下文
+  const subMessages: ChatCompletionMessageParam[] = [
+    {
+      role: "system",
+      content: task + "\n\n你的回复将作为子任务结果返回给主 Agent。请简洁、准确地完成任务。",
+    },
+    {
+      role: "user",
+      content: context || "开始执行任务",
+    },
+  ];
+
+  // 子 Agent 可用的工具：排除 delegate，防止无限递归
+  let subTools: Tool[] = getToolsWithoutDelegate();
+  if (allowedTools.length > 0) {
+    // 如果主 Agent 指定了工具列表，进一步过滤
+    subTools = subTools.filter((t) => allowedTools.includes(t.definition.name));
+  }
+
+  console.log(c.magenta("\n  ┌──────────────────────────────────────┐"));
+  console.log(c.magenta(`  │  🤖 ${label} 启动                      │`));
+  console.log(c.magenta(`  │  任务: ${task.slice(0, 40)}...  │`));
+  console.log(c.magenta(`  │  可用工具: ${subTools.map((t) => t.definition.name).join(", ")}`.padEnd(42) + `│`));
+  console.log(c.magenta("  └──────────────────────────────────────┘"));
+
+  const result = await runAgentLoop(
+    client,
+    config,
+    subMessages,
+    confirmCallback,
+    { logPrefix: "  │ ", tools: subTools, maxTurns: 10, label },
+  );
+
+  console.log(c.magenta("  ┌──────────────────────────────────────┐"));
+  console.log(c.magenta(`  │  ✅ ${label} 完成                      │`));
+  console.log(c.magenta("  └──────────────────────────────────────┘"));
+
+  return result;
+}
+
+// ============================================================
+// Agent 循环
+// ============================================================
+
+export interface RunAgentLoopOptions {
+  /** 输出日志的前缀，子 Agent 使用 "  │ " 实现缩进效果 */
+  logPrefix?: string;
+  /** 使用的工具列表，子 Agent 不能包含 delegate */
+  tools?: Tool[];
+  /** 最大循环轮数，子 Agent 比主 Agent 少 */
+  maxTurns?: number;
+  /** Agent 标签，用于区分主 Agent 和子 Agent */
+  label?: string;
+}
+
+/**
+ * ===== Agent 循环（流式输出 + 共享消息历史 + 多 Agent 协作） =====
  *
  * 这是 Agent 的核心：一个"思考-行动-观察"的循环。
- *
- * 与之前版本的关键区别：
- *   messages 数组由调用方传入并维护，不再在函数内部创建。
- *   这意味着多次调用 runAgentLoop 可以共享同一个 messages 数组，
- *   实现跨 prompt 的对话记忆。
  *
  * 流程：
  *   1. 使用传入的 messages 数组（已包含 system + 历史 + 新 user 消息）调用 LLM
@@ -173,28 +234,35 @@ function formatToolResult(result: string): { output: string; isError: boolean } 
  *   3. 流结束后判断：
  *      a) 文本回复 → 把 assistant 消息追加到 messages，退出循环
  *      b) 工具调用 → 进入步骤 4
- *   4. 逐个检查工具是否需要确认：
- *      - safe 工具 → 直接执行
- *      - dangerous 工具 → 调用 confirmCallback 询问用户
+ *   4. 如果是 delegate 工具 → 创建子 Agent 独立运行（可并行多个）
+ *      如果是普通工具 → 逐个检查确认后执行
  *   5. 执行工具，把 assistant(tool_calls) 和 tool(result) 追加到 messages
  *   6. 回到步骤 1，让 LLM 根据新信息继续思考
  *
  * 这个循环会一直运行，直到 LLM 决定不再调用工具（给出最终回复）。
- * 设置了 maxTurns 防止无限循环。
  */
 export async function runAgentLoop(
   client: OpenAI,
   config: AgentConfig,
-  messages: ChatCompletionMessageParam[], // 共享的对话历史，由调用方维护
+  messages: ChatCompletionMessageParam[],
   confirmCallback: ConfirmCallback,
+  options: RunAgentLoopOptions = {},
 ): Promise<string> {
-  // 安全阀：最多循环 30 轮，防止无限调用工具
-  const MAX_TURNS = 30;
+  const logPrefix = options.logPrefix ?? "";
+  const tools = options.tools ?? allTools;
+  const MAX_TURNS = options.maxTurns ?? 30;
+  const label = options.label ?? "主 Agent";
+
+  // 带前缀的日志辅助函数
+  const log = (msg: string) => console.log(logPrefix + msg);
+  // 带前缀的流式输出
+  const write = (s: string) => process.stdout.write(logPrefix + s);
+
   // 连续失败计数 —— 同一轮对话中工具调用连续失败的次数
   let consecutiveFailures = 0;
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
-    console.log(c.dim(`\n--- Agent 循环 第 ${turn + 1} 轮 ---`));
+    log(c.dim(`\n--- [${label}] 循环 第 ${turn + 1} 轮 ---`));
 
     // 步骤 0: 上下文管理 —— 裁剪过长的对话历史
     compactMessages(messages);
@@ -202,262 +270,228 @@ export async function runAgentLoop(
     // =========================================
     // 步骤 1: 流式调用 LLM
     // =========================================
-    console.log(c.cyan("📡 发送请求到 LLM（流式模式）..."));
-    console.log(c.dim(`   模型: ${config.model}`));
-    console.log(c.dim(`   当前对话消息数: ${messages.length}`));
+    log(c.cyan("📡 发送请求到 LLM（流式模式）..."));
+    log(c.dim(`   模型: ${config.model}`));
+    log(c.dim(`   当前对话消息数: ${messages.length}`));
 
-    /**
-     * stream: true 让 LLM 不等待全部生成完毕再返回，而是边生成边发送。
-     * 返回的是一个异步可迭代对象（AsyncIterable），每个 chunk 是一个小片段。
-     */
     const stream = await client.chat.completions.create({
       model: config.model,
       messages,
-      tools: allTools.map((t) => ({
+      tools: tools.map((t) => ({
         type: "function" as const,
         function: t.definition,
       })),
       tool_choice: "auto",
-      stream: true, // 启用流式输出
+      stream: true,
     });
 
     // ---- 累积器：从流式 chunk 中拼装完整的响应 ----
-    let fullContent = ""; // 累积文本内容
-    // 工具调用需要在 Map 中累积，因为可能有多个 tool_call 同时到达
+    let fullContent = "";
     const toolCallAcc = new Map<number, AccumulatedToolCall>();
 
-    process.stdout.write(c.blue("🤖 ")); // 打印 Agent 回复前缀
+    write(c.blue("🤖 "));
 
-    // 遍历流中的每一个 chunk
     for await (const chunk of stream) {
       const delta = chunk.choices?.[0]?.delta;
       if (!delta) continue;
 
-      /**
-       * 文本内容增量（delta.content）
-       * 每个 chunk 可能包含几个字的文本，直接追加到终端即可实现打字机效果
-       */
       if (delta.content) {
         fullContent += delta.content;
-        process.stdout.write(delta.content); // 逐 token 输出到终端
+        write(delta.content);
       }
 
-      /**
-       * 工具调用增量（delta.tool_calls）
-       * 工具调用的数据是分多个 chunk 到达的：
-       *   - 第一个 chunk 携带 id 和 function.name
-       *   - 后续 chunk 携带 function.arguments 的片段（JSON 字符串的一部分）
-       * 需要把这些片段拼成完整的工具调用
-       */
       if (delta.tool_calls) {
         for (const tc of delta.tool_calls) {
           const idx = tc.index;
-          // 如果这个索引的工具调用还不存在，初始化一个空的累积器
           if (!toolCallAcc.has(idx)) {
             toolCallAcc.set(idx, { id: "", name: "", arguments: "" });
           }
           const acc = toolCallAcc.get(idx)!;
-          if (tc.id) acc.id = tc.id; // id 只在第一个 chunk 出现
-          if (tc.function?.name) acc.name += tc.function.name; // name 只在第一个 chunk 出现
-          if (tc.function?.arguments) acc.arguments += tc.function.arguments; // arguments 可能跨多个 chunk
+          if (tc.id) acc.id = tc.id;
+          if (tc.function?.name) acc.name += tc.function.name;
+          if (tc.function?.arguments) acc.arguments += tc.function.arguments;
         }
       }
     }
 
-    // 流结束，输出换行
     if (fullContent) {
-      process.stdout.write("\n");
+      write("\n");
     }
 
     // ---- 判断流结束后的响应类型 ----
 
     /**
      * 情况 A: LLM 决定调用工具
-     * 工具调用的累积器中有数据，说明 LLM 想要调用工具
      */
     if (toolCallAcc.size > 0) {
-      console.log(
-        c.yellow(`\n🔧 LLM 决定调用 ${toolCallAcc.size} 个工具:`),
-      );
+      log(c.yellow(`\n🔧 LLM 决定调用 ${toolCallAcc.size} 个工具:`));
 
-      // 将累积的工具调用拼装成 OpenAI API 兼容的格式
       const toolCalls = Array.from(toolCallAcc.entries())
-        .sort(([a], [b]) => a - b) // 按 index 排序，保证顺序
+        .sort(([a], [b]) => a - b)
         .map(([_, tc]) => ({
           id: tc.id,
           type: "function" as const,
           function: {
             name: tc.name,
-            arguments: tc.arguments, // 累积完成的 JSON 字符串
+            arguments: tc.arguments,
           },
         }));
 
-      // 先记录 LLM 的工具调用请求到对话历史
       messages.push({
         role: "assistant",
         content: fullContent || null,
         tool_calls: toolCalls,
       });
 
-      /**
-       * 步骤 2: 逐个执行每个工具
-       *
-       * OpenAI 允许一次性返回多个 tool_calls，我们需要逐个处理。
-       * 每个工具执行后，将结果以 role: "tool" 的消息格式追加到对话历史。
-       */
+      // 收集同一轮中所有的 delegate 子任务，实现并行执行
+      const delegatePromises: Array<Promise<{ id: string; result: string }>> = [];
+      // 子 Agent 编号，用于输出标识
+      let subAgentIndex = 0;
+
       for (const toolCall of toolCalls) {
         const toolName = toolCall.function.name;
-        // LLM 返回的参数是 JSON 字符串，需要解析
         const toolArgs = JSON.parse(toolCall.function.arguments);
         const tool = findTool(toolName);
 
-        // 打印详细的工具调用信息
-        console.log(c.yellow(`\n  📞 工具调用链:  ${toolName}`));
-        console.log(c.yellow(`     ├─ ID:        ${toolCall.id}`));
-        console.log(c.yellow(`     ├─ 参数:      ${JSON.stringify(toolArgs)}`));
+        log(c.yellow(`\n  📞 工具调用链:  ${toolName}`));
+        log(c.yellow(`     ├─ ID:        ${toolCall.id}`));
+        log(c.yellow(`     ├─ 参数:      ${JSON.stringify(toolArgs)}`));
 
         let toolResult: string;
 
         if (!tool) {
           toolResult = `[ERROR] 错误: 未找到工具 "${toolName}"`;
-          console.log(c.red(`     └─ 返回结果:  ❌ ${toolResult}`));
-          // 工具不存在也算失败，需要反思
+          log(c.red(`     └─ 返回结果:  ❌ ${toolResult}`));
           consecutiveFailures++;
-          messages.push({
-            role: "tool",
-            tool_call_id: toolCall.id,
-            content: toolResult,
-          });
+          messages.push({ role: "tool", tool_call_id: toolCall.id, content: toolResult });
           if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-            console.log(c.red(`\n  🛑 连续失败 ${consecutiveFailures} 次，强制停止重试`));
+            log(c.red(`\n  🛑 连续失败 ${consecutiveFailures} 次，强制停止重试`));
             messages.push({
               role: "system",
               content: `⚠️ 已连续失败 ${consecutiveFailures} 次。请停止尝试，向用户解释失败原因。不要再次调用工具。`,
-            });
-          } else {
-            messages.push({
-              role: "system",
-              content: `⚠️ 工具 "${toolName}" 不存在。请使用已注册的工具，或向用户说明无法完成该操作。`,
             });
           }
           continue;
         }
 
-        // 打印风险等级
-          const riskLabel = isDangerous(tool) ? "🔴 危险" : "🟢 安全";
-          console.log(c.yellow(`     ├─ 风险等级:  ${riskLabel}`));
+        const riskLabel = isDangerous(tool) ? "🔴 危险" : "🟢 安全";
+        log(c.yellow(`     ├─ 风险等级:  ${riskLabel}`));
 
-          /**
-           * 步骤 3: 权限检查
-           * 危险工具（file_write、run_bash）需要用户确认后才能执行
-           */
-          if (isDangerous(tool)) {
-            console.log(c.yellow(`     ├─ 状态:      ⚠️ 等待用户确认...`));
-            const approved = await confirmCallback(toolName, toolArgs);
+        /**
+         * ===== 特殊处理：delegate 工具 =====
+         * delegate 不通过 tool.execute() 执行，而是创建子 Agent 循环。
+         * 多个 delegate 可以并行执行（Promise.all）。
+         */
+        if (toolName === "delegate") {
+          const task = toolArgs["task"] as string;
+          const context = (toolArgs["context"] as string) || "";
+          const allowedTools = (toolArgs["tools"] as string)
+            ? (toolArgs["tools"] as string).split(",").map((s) => s.trim())
+            : [];
 
-            if (!approved) {
-              // 用户拒绝执行，告诉 LLM 操作被取消
-              toolResult = `[ERROR] 操作被用户拒绝: ${toolName}(${JSON.stringify(toolArgs)})。请向用户解释原因并尝试其他方式。`;
-              console.log(c.red(`     └─ 返回结果:  ❌ 用户拒绝了此操作`));
-              // 用户拒绝也算失败，需要反思
-              consecutiveFailures++;
-              messages.push({
-                role: "tool",
-                tool_call_id: toolCall.id,
-                content: toolResult,
-              });
-              if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                console.log(c.red(`\n  🛑 连续失败 ${consecutiveFailures} 次，强制停止重试`));
-                messages.push({
-                  role: "system",
-                  content: `⚠️ 已连续失败 ${consecutiveFailures} 次。请停止尝试，向用户解释失败原因。不要再次调用工具。`,
-                });
-              } else {
-                messages.push({
-                  role: "system",
-                  content: `⚠️ 用户拒绝了 "${toolName}" 操作。请尝试其他不需要写文件或执行命令的方式来完成用户的需求。`,
-                });
-              }
-              continue;
-            }
-            console.log(c.yellow(`     ├─ 状态:      ✅ 用户已确认，执行中...`));
-          } else {
-            console.log(c.yellow(`     ├─ 状态:      执行中...`));
-          }
+          log(c.yellow(`     ├─ 状态:      🚀 启动子 Agent...`));
+          subAgentIndex++;
+          const subLabel = `子 Agent ${subAgentIndex}`;
+          delegatePromises.push(
+            runSubAgent(client, config, task, context, allowedTools, confirmCallback, subLabel).then(
+              (result) => ({ id: toolCall.id, result }),
+            ),
+          );
+          continue; // 跳过当前循环，等待所有 delegate 完成后统一处理
+        }
 
-          // 步骤 4: 执行工具
-          toolResult = await tool.execute(toolArgs);
+        // ---- 普通工具：权限检查 + 执行 ----
+        if (isDangerous(tool)) {
+          log(c.yellow(`     ├─ 状态:      ⚠️ 等待用户确认...`));
+          const approved = await confirmCallback(toolName, toolArgs);
 
-          // 步骤 4.5: 反思/纠错 —— 检查工具执行结果
-          const { output, isError } = formatToolResult(toolResult);
-
-          if (isError) {
-            // 工具执行失败
+          if (!approved) {
+            toolResult = `[ERROR] 操作被用户拒绝: ${toolName}(${JSON.stringify(toolArgs)})。请向用户解释原因并尝试其他方式。`;
+            log(c.red(`     └─ 返回结果:  ❌ 用户拒绝了此操作`));
             consecutiveFailures++;
-            console.log(c.red(`     └─ 返回结果:  ❌ ${output}`));
-
-            // 把失败结果追加到对话历史
-            messages.push({
-              role: "tool",
-              tool_call_id: toolCall.id,
-              content: output,
-            });
-
+            messages.push({ role: "tool", tool_call_id: toolCall.id, content: toolResult });
             if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-              // 连续失败次数过多，强制 LLM 停止尝试
-              console.log(
-                c.red(`\n  🛑 连续失败 ${consecutiveFailures} 次，强制停止重试`),
-              );
+              log(c.red(`\n  🛑 连续失败 ${consecutiveFailures} 次，强制停止重试`));
               messages.push({
                 role: "system",
-                content: `⚠️ 已连续失败 ${consecutiveFailures} 次。请停止尝试，向用户解释失败原因并给出可行的替代方案。不要再次调用工具。`,
+                content: `⚠️ 已连续失败 ${consecutiveFailures} 次。请停止尝试，向用户解释失败原因。不要再次调用工具。`,
               });
             } else {
-              // 注入反思提示，引导 LLM 分析原因并换策略
-              console.log(
-                c.yellow(
-                  `  💡 注入反思提示（第 ${consecutiveFailures} 次失败），引导 LLM 重试...`,
-                ),
-              );
               messages.push({
                 role: "system",
-                content: `⚠️ 工具调用失败（第 ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES} 次）。\n失败原因: ${output}\n\n请分析失败原因，然后:\n1. 是否可以用不同的参数重试？\n2. 是否可以用其他工具实现同样的目标？\n3. 如果无法解决，向用户解释原因。`,
+                content: `⚠️ 用户拒绝了 "${toolName}" 操作。请尝试其他不需要写文件或执行命令的方式来完成用户的需求。`,
               });
             }
-          } else {
-            // 工具执行成功，重置失败计数器
-            consecutiveFailures = 0;
-            console.log(c.green(`     └─ 返回结果:  ${output}`));
+            continue;
+          }
+          log(c.yellow(`     ├─ 状态:      ✅ 用户已确认，执行中...`));
+        } else {
+          log(c.yellow(`     ├─ 状态:      执行中...`));
+        }
+
+        toolResult = await tool.execute(toolArgs);
+        const { output, isError } = formatToolResult(toolResult);
+
+        if (isError) {
+          consecutiveFailures++;
+          log(c.red(`     └─ 返回结果:  ❌ ${output}`));
+          messages.push({ role: "tool", tool_call_id: toolCall.id, content: output });
+
+          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            log(c.red(`\n  🛑 连续失败 ${consecutiveFailures} 次，强制停止重试`));
             messages.push({
-              role: "tool",
-              tool_call_id: toolCall.id,
-              content: output,
+              role: "system",
+              content: `⚠️ 已连续失败 ${consecutiveFailures} 次。请停止尝试，向用户解释失败原因并给出可行的替代方案。不要再次调用工具。`,
+            });
+          } else {
+            log(c.yellow(`  💡 注入反思提示（第 ${consecutiveFailures} 次失败），引导 LLM 重试...`));
+            messages.push({
+              role: "system",
+              content: `⚠️ 工具调用失败（第 ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES} 次）。\n失败原因: ${output}\n\n请分析失败原因，然后:\n1. 是否可以用不同的参数重试？\n2. 是否可以用其他工具实现同样的目标？\n3. 如果无法解决，向用户解释原因。`,
             });
           }
+        } else {
+          consecutiveFailures = 0;
+          log(c.green(`     └─ 返回结果:  ${output}`));
+          messages.push({ role: "tool", tool_call_id: toolCall.id, content: output });
+        }
       }
 
-      // 回到循环开头，让 LLM 根据工具结果重新思考
-      console.log(c.cyan("\n🔄 工具执行完毕，让 LLM 根据结果继续思考..."));
+      /**
+       * 等待所有 delegate 子任务完成，将结果追加到 messages
+       * 这里使用 Promise.all 实现并行等待
+       */
+      if (delegatePromises.length > 0) {
+        log(c.cyan(`\n  ⏳ 等待 ${delegatePromises.length} 个子 Agent 完成...`));
+        const results = await Promise.all(delegatePromises);
+        for (const { id, result } of results) {
+          messages.push({
+            role: "tool",
+            tool_call_id: id,
+            content: `[SUCCESS] 子 Agent 执行完成:\n${result}`,
+          });
+        }
+        log(c.green(`  ✅ 所有子 Agent 已完成`));
+      }
+
+      log(c.cyan("\n🔄 工具执行完毕，让 LLM 根据结果继续思考..."));
       continue;
     }
 
     // =========================================
     // 情况 B: LLM 给出最终文本回复（不再调用工具）
-    // 文本已经在流式接收时实时打印到终端了
     // =========================================
     const finalAnswer = fullContent || "（LLM 未返回内容）";
 
-    // 把 LLM 的最终回复也追加到对话历史，下次对话 LLM 能看到
     messages.push({
       role: "assistant",
       content: finalAnswer,
     });
 
-    console.log(c.green("\n✅ LLM 给出了最终回复（不再调用工具）"));
+    log(c.green("\n✅ LLM 给出了最终回复（不再调用工具）"));
     return finalAnswer;
   }
 
-  // 如果超过了最大循环次数仍未得到最终答案
-  console.log(c.red("\n⚠️ 达到最大循环次数限制，Agent 停止思考"));
+  log(c.red("\n⚠️ 达到最大循环次数限制，Agent 停止思考"));
   return "抱歉，我思考了太多轮还没有得出结论。请尝试简化问题。";
 }
