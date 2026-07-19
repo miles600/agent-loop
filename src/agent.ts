@@ -107,16 +107,54 @@ export function compactMessages(messages: ChatCompletionMessageParam[]): number 
   return removed;
 }
 
+// ============================================================
+// 反思/纠错 —— 工具调用失败后 LLM 自动分析原因并重试
+// ============================================================
+
+// 连续失败多少次后强制停止，防止无限重试
+const MAX_CONSECUTIVE_FAILURES = 3;
+
 /**
- * 更高级的上下文管理策略（未实现，供参考）：
+ * 判断工具返回结果是否为错误
+ * 通过关键词匹配识别：中文错误前缀、HTTP 错误码、异常信息等
+ */
+function isToolError(result: string): boolean {
+  const errorPatterns = [
+    "错误",           // 通用错误前缀
+    "无法",           // 无法计算、无法读取等
+    "失败",           // 抓取失败、写入失败等
+    "[ERROR]",        // 标准错误格式
+    "操作被用户拒绝",  // 用户拒绝了危险操作
+    "Error:",         // 英文错误
+    "not found",      // 文件不存在
+    "HTTP 4",         // 4xx 客户端错误
+    "HTTP 5",         // 5xx 服务端错误
+  ];
+  return errorPatterns.some((p) => result.includes(p));
+}
+
+/**
+ * 标准化错误格式，加上 [ERROR] 前缀方便 LLM 识别
+ */
+function formatToolResult(result: string): { output: string; isError: boolean } {
+  const err = isToolError(result);
+  return {
+    output: err ? `[ERROR] ${result}` : `[SUCCESS] ${result}`,
+    isError: err,
+  };
+}
+
+/**
+ * 更高级的反思/纠错策略（未实现，供参考）：
  *
- * 1. 摘要压缩 —— 让 LLM 把旧消息总结成一段话，替代原始消息
- *    messages = [system, { role: "user", content: "之前的对话摘要: ..." }, ...recent]
+ * 1. 反思链 —— 不止告诉 LLM 失败了，还让它显式输出"为什么失败"和"新策略"
+ *    在 reflection prompt 中要求 LLM 先输出分析再尝试
  *
- * 2. 分层记忆 —— 最近 3 轮保留原文，3-10 轮保留摘要，更早的只保留关键词
+ * 2. 自适应重试 —— 根据错误类型自动调整参数
+ *    例如 URL 404 → 尝试去掉路径重试；DNS 失败 → 建议用户检查网络
  *
- * 3. 向量检索 —— 把所有历史消息向量化存到外部数据库，
- *    每次提问时只检索和当前问题最相关的 N 条历史消息
+ * 3. 工具降级 —— 当前工具不可用时，自动切换到备选工具
+ *    例如 web_fetch 失败 → 尝试用 file_read 读取本地缓存
  */
 
 /**
@@ -150,8 +188,10 @@ export async function runAgentLoop(
   messages: ChatCompletionMessageParam[], // 共享的对话历史，由调用方维护
   confirmCallback: ConfirmCallback,
 ): Promise<string> {
-  // 安全阀：最多循环 10 轮，防止无限调用工具
+  // 安全阀：最多循环 30 轮，防止无限调用工具
   const MAX_TURNS = 30;
+  // 连续失败计数 —— 同一轮对话中工具调用连续失败的次数
+  let consecutiveFailures = 0;
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     console.log(c.dim(`\n--- Agent 循环 第 ${turn + 1} 轮 ---`));
@@ -279,10 +319,31 @@ export async function runAgentLoop(
         let toolResult: string;
 
         if (!tool) {
-          toolResult = `错误: 未找到工具 "${toolName}"`;
-          console.log(c.red(`     └─ 返回结果:  ${toolResult}`));
-        } else {
-          // 打印风险等级
+          toolResult = `[ERROR] 错误: 未找到工具 "${toolName}"`;
+          console.log(c.red(`     └─ 返回结果:  ❌ ${toolResult}`));
+          // 工具不存在也算失败，需要反思
+          consecutiveFailures++;
+          messages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: toolResult,
+          });
+          if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            console.log(c.red(`\n  🛑 连续失败 ${consecutiveFailures} 次，强制停止重试`));
+            messages.push({
+              role: "system",
+              content: `⚠️ 已连续失败 ${consecutiveFailures} 次。请停止尝试，向用户解释失败原因。不要再次调用工具。`,
+            });
+          } else {
+            messages.push({
+              role: "system",
+              content: `⚠️ 工具 "${toolName}" 不存在。请使用已注册的工具，或向用户说明无法完成该操作。`,
+            });
+          }
+          continue;
+        }
+
+        // 打印风险等级
           const riskLabel = isDangerous(tool) ? "🔴 危险" : "🟢 安全";
           console.log(c.yellow(`     ├─ 风险等级:  ${riskLabel}`));
 
@@ -296,13 +357,27 @@ export async function runAgentLoop(
 
             if (!approved) {
               // 用户拒绝执行，告诉 LLM 操作被取消
-              toolResult = `操作被用户拒绝: ${toolName}(${JSON.stringify(toolArgs)})。请向用户解释原因并尝试其他方式。`;
+              toolResult = `[ERROR] 操作被用户拒绝: ${toolName}(${JSON.stringify(toolArgs)})。请向用户解释原因并尝试其他方式。`;
               console.log(c.red(`     └─ 返回结果:  ❌ 用户拒绝了此操作`));
+              // 用户拒绝也算失败，需要反思
+              consecutiveFailures++;
               messages.push({
                 role: "tool",
                 tool_call_id: toolCall.id,
                 content: toolResult,
               });
+              if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                console.log(c.red(`\n  🛑 连续失败 ${consecutiveFailures} 次，强制停止重试`));
+                messages.push({
+                  role: "system",
+                  content: `⚠️ 已连续失败 ${consecutiveFailures} 次。请停止尝试，向用户解释失败原因。不要再次调用工具。`,
+                });
+              } else {
+                messages.push({
+                  role: "system",
+                  content: `⚠️ 用户拒绝了 "${toolName}" 操作。请尝试其他不需要写文件或执行命令的方式来完成用户的需求。`,
+                });
+              }
               continue;
             }
             console.log(c.yellow(`     ├─ 状态:      ✅ 用户已确认，执行中...`));
@@ -312,15 +387,53 @@ export async function runAgentLoop(
 
           // 步骤 4: 执行工具
           toolResult = await tool.execute(toolArgs);
-          console.log(c.green(`     └─ 返回结果:  ${toolResult}`));
-        }
 
-        // 步骤 5: 把工具执行结果追加到对话历史
-        messages.push({
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: toolResult,
-        });
+          // 步骤 4.5: 反思/纠错 —— 检查工具执行结果
+          const { output, isError } = formatToolResult(toolResult);
+
+          if (isError) {
+            // 工具执行失败
+            consecutiveFailures++;
+            console.log(c.red(`     └─ 返回结果:  ❌ ${output}`));
+
+            // 把失败结果追加到对话历史
+            messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: output,
+            });
+
+            if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+              // 连续失败次数过多，强制 LLM 停止尝试
+              console.log(
+                c.red(`\n  🛑 连续失败 ${consecutiveFailures} 次，强制停止重试`),
+              );
+              messages.push({
+                role: "system",
+                content: `⚠️ 已连续失败 ${consecutiveFailures} 次。请停止尝试，向用户解释失败原因并给出可行的替代方案。不要再次调用工具。`,
+              });
+            } else {
+              // 注入反思提示，引导 LLM 分析原因并换策略
+              console.log(
+                c.yellow(
+                  `  💡 注入反思提示（第 ${consecutiveFailures} 次失败），引导 LLM 重试...`,
+                ),
+              );
+              messages.push({
+                role: "system",
+                content: `⚠️ 工具调用失败（第 ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES} 次）。\n失败原因: ${output}\n\n请分析失败原因，然后:\n1. 是否可以用不同的参数重试？\n2. 是否可以用其他工具实现同样的目标？\n3. 如果无法解决，向用户解释原因。`,
+              });
+            }
+          } else {
+            // 工具执行成功，重置失败计数器
+            consecutiveFailures = 0;
+            console.log(c.green(`     └─ 返回结果:  ${output}`));
+            messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: output,
+            });
+          }
       }
 
       // 回到循环开头，让 LLM 根据工具结果重新思考
